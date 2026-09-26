@@ -15,6 +15,7 @@ from .core import (
     outage_restoration,
     peak_risk,
     protection_selectivity,
+    startup_order,
     unregistered_load,
 )
 from .models import (
@@ -30,6 +31,8 @@ from .models import (
     PeakRiskResponse,
     ProtectionSelectivityRequest,
     ProtectionSelectivityResponse,
+    StartupOrderRequest,
+    StartupOrderResponse,
     UnregisteredLoadRequest,
     UnregisteredLoadResponse,
 )
@@ -44,9 +47,10 @@ app = FastAPI(
         "评估至多 K 条负载同时升至峰值时的最坏越限风险，"
         "在故障线段断开后评估各候选跨接线的恢复方案并按最低节点电压余量择优，"
         "枚举可切除负载组合，选出以最小切除电流消除全部越限的切负荷方案，"
-        "或按各线段保护曲线校核故障下各级保护的动作选择性并标出基线误动风险。"
+        "或按各线段保护曲线校核故障下各级保护的动作选择性并标出基线误动风险，"
+        "或搜索待投运负载的完整可行投运顺序并给出每步启动瞬间的最低电压与最大负载率。"
     ),
-    version="1.6.0",
+    version="1.7.0",
 )
 
 
@@ -82,6 +86,9 @@ _FIELD_LABELS = {
     "time": "动作时间",
     "faults": "故障列表",
     "min_grading_margin": "最小级差",
+    "startup_loads": "待投运负载列表",
+    "steady_current": "稳态电流",
+    "startup_current": "启动电流",
 }
 
 # measurements 内字段的中文标签（与负载字段同名时区分为“实测”）
@@ -117,6 +124,8 @@ _CUSTOM_MESSAGES = {
     ("peak_current", "greater_than_equal"): "峰值电流不能为负（须 ≥ 0）",
     ("max_simultaneous_peaks", "greater_than_equal"): "最大同时峰值数不能为负（须 ≥ 0）",
     ("min_grading_margin", "greater_than_equal"): "最小级差不能为负（须 ≥ 0）",
+    ("steady_current", "greater_than_equal"): "稳态电流不能为负（须 ≥ 0）",
+    ("startup_current", "greater_than_equal"): "启动电流不能为负（须 ≥ 0）",
 }
 
 # curves 内字段的定制提示（“current” 与负载字段同名，须区分）
@@ -322,6 +331,21 @@ def protection_selectivity_endpoint(payload: ProtectionSelectivityRequest) -> di
     )
 
 
+@app.post(
+    "/startup-order",
+    response_model=StartupOrderResponse,
+    summary="搜索待投运负载的完整可行投运顺序并给出每步启动瞬间校核结果",
+)
+def startup_order_endpoint(payload: StartupOrderRequest) -> dict:
+    return startup_order(
+        source_voltage=payload.source_voltage,
+        min_voltage=payload.min_voltage,
+        segments_in=payload.segments,
+        loads_in=payload.loads,
+        startup_loads_in=payload.startup_loads,
+    )
+
+
 @app.get("/health", summary="健康检查")
 def health() -> dict:
     return {"status": "ok"}
@@ -338,6 +362,7 @@ def index() -> dict:
         "outage_restoration": "POST /outage-restoration",
         "load_shedding": "POST /load-shedding",
         "protection_selectivity": "POST /protection-selectivity",
+        "startup_order": "POST /startup-order",
         "docs": "/docs",
         "health": "/health",
     }

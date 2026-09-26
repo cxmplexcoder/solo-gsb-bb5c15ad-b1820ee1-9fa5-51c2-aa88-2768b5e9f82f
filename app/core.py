@@ -36,6 +36,13 @@ source 所在分量接入失电分量任意节点，失电分量从接入点重�
 故障沿故障节点至 source 的路径计算各级装置动作时间：距故障最近的装置必须动作，
 所有会动作的上级装置须比它至少晚最小级差，违反者记为失配线段；并用基线线段电流
 标出正常负荷下即会动作（可能误动）的装置。返回逐故障动作顺序、失配线段与总体结论。
+
+``startup_order`` 在基线潮流之上逐条投运 1～10 条新负载：每步仅该步新投运负载按
+启动电流计入、此前投运负载按稳态电流计入、未投运负载不计入；用未舍入的线段电流
+与节点电压判定额定电流与最低电压（恰好触限允许）。基线已越限时抛
+``BaselineViolationError``；否则用子集状态（已投运集合）深度优先搜索完整可行顺序，
+候选按输入序号升序尝试，故首个完整可行顺序即按输入序号字典序最小者，无解返回
+``infeasible``。
 """
 
 from __future__ import annotations
@@ -1246,3 +1253,182 @@ def protection_selectivity(
         "faults": fault_results,
         "misoperation_segments": misoperation_segments,
     }
+
+
+def startup_order(
+    source_voltage: float,
+    min_voltage: float,
+    segments_in: Sequence,
+    loads_in: Sequence,
+    startup_loads_in: Sequence,
+) -> dict:
+    """搜索待投运负载的完整可行投运顺序，返回可 JSON 序列化的结果字典。
+
+    每条待投运负载给出节点、稳态电流与启动电流（启动电流 ≥ 稳态电流）。第 k 步
+    投运负载 i 时的全树潮流 = 基线（``loads`` 既有负载）潮流 + 已投运负载的稳态
+    电流贡献 + 负载 i 的启动电流贡献；未投运负载不计入。负载 j 对线段电流的贡献
+    为其电流（j 位于该线段下游时），对节点电压的压降贡献 = 电流 × 被校核节点与
+    j 所在节点两条根路径的公共线段电阻之和（与 ``peak_risk`` 口径一致）。
+
+    每步用未舍入的线段电流与节点电压校核：线段电流 ≤ 额定电流、各节点电压 ≥
+    生效最低允许电压（含节点级覆盖），EPS 内触限不算越限。基线已越限时抛
+    ``BaselineViolationError``。
+
+    可行性只取决于已投运集合（子集状态）：用位掩码记忆化做深度优先搜索，每步按
+    输入序号升序尝试候选，故找到的首个完整可行顺序即按输入序号字典序最小者；
+    不存在完整可行顺序时返回 ``infeasible``。
+    """
+    tree = _prepare_tree(source_voltage, segments_in, loads_in)
+
+    # 待投运负载节点校验（须存在于树中，可为 source）
+    known_nodes = set(tree.parent_of) | {ROOT_NODE}
+    errors = [
+        f"待投运负载节点 '{item.node}' 不存在于树中"
+        for item in startup_loads_in
+        if item.node not in known_nodes
+    ]
+    if errors:
+        raise InputValidationError("待投运负载定义无效", errors)
+
+    over_current_segments, under_voltage_nodes = _find_violations(tree, min_voltage)
+    if over_current_segments or under_voltage_nodes:
+        details = [
+            f"线段 '{v['segment_id']}' 已超额定电流：{v['current']} A（额定 {v['rated_current']} A）"
+            for v in over_current_segments
+        ]
+        details += [
+            f"节点 '{v['node']}' 已欠压：{v['voltage']} V（最低允许 {v['min_voltage']} V）"
+            for v in under_voltage_nodes
+        ]
+        raise BaselineViolationError("基线校核已存在超额定电流或欠压，无法评估投运顺序", details)
+
+    seg_by_child = {seg.child: seg for seg in tree.segments}
+    n_seg = len(tree.segments)
+    n_node = len(tree.order)
+    node_pos = {node: pos for pos, node in enumerate(tree.order)}
+
+    base_seg_current = [tree.seg_current[seg.id] for seg in tree.segments]
+    rated_current = [seg.rated_current for seg in tree.segments]
+    base_node_voltage = [tree.node_voltage[node] for node in tree.order]
+    threshold = [_node_threshold(tree, node, min_voltage) for node in tree.order]
+
+    # 每条待投运负载对各线段电流（A）与各节点压降（V）的单位贡献矩阵
+    seg_add: list[list[float]] = []
+    node_drop: list[list[float]] = []
+    for item in startup_loads_in:
+        path_ids: set[str] = set()
+        node = item.node
+        while node != ROOT_NODE:
+            seg = seg_by_child[node]
+            path_ids.add(seg.id)
+            node = seg.parent
+        seg_add.append([1.0 if seg.id in path_ids else 0.0 for seg in tree.segments])
+
+        common = [0.0] * n_node
+        for parent in tree.order:  # BFS：父先于子
+            pp = node_pos[parent]
+            for seg in tree.children_map.get(parent, []):
+                cp = node_pos[seg.child]
+                common[cp] = common[pp] + (seg.resistance if seg.id in path_ids else 0.0)
+        node_drop.append(common)
+
+    steady = [item.steady_current for item in startup_loads_in]
+    startup = [item.startup_current for item in startup_loads_in]
+    n = len(startup_loads_in)
+
+    def _feasible(seg_extra: list[float], node_extra: list[float]) -> bool:
+        """给定各线段附加电流与各节点附加压降，判定是否无越限（恰好触限允许）。"""
+        for k in range(n_seg):
+            if base_seg_current[k] + seg_extra[k] > rated_current[k] + EPS:
+                return False
+        for p in range(n_node):
+            if base_node_voltage[p] - node_extra[p] < threshold[p] - EPS:
+                return False
+        return True
+
+    # ``seg_extra`` / ``node_extra`` 只累计已投运负载的**稳态**贡献（进入下一步前
+    # 上一步负载的启动电流已回落为稳态电流）；评估候选 i 时临时叠加 i 的启动电流。
+    # 故某候选能否在当前状态投运只取决于已投运集合，记忆化键用位掩码即可。
+    dead: set[int] = set()
+
+    def _search(
+        mask: int,
+        seg_extra: list[float],
+        node_extra: list[float],
+        path: list[int],
+    ) -> Optional[list[int]]:
+        if mask in dead:
+            return None
+        if len(path) == n:
+            return path
+
+        for i in range(n):
+            if mask >> i & 1:
+                continue
+            si = startup[i]
+            next_seg = [seg_extra[k] + si * seg_add[i][k] for k in range(n_seg)]
+            next_node = [node_extra[p] + si * node_drop[i][p] for p in range(n_node)]
+            if not _feasible(next_seg, next_node):
+                continue
+            # 启动瞬间过后按稳态电流计入
+            settled_seg = [seg_extra[k] + steady[i] * seg_add[i][k] for k in range(n_seg)]
+            settled_node = [node_extra[p] + steady[i] * node_drop[i][p] for p in range(n_node)]
+            result = _search(mask | (1 << i), settled_seg, settled_node, path + [i])
+            if result is not None:
+                return result
+
+        dead.add(mask)
+        return None
+
+    order = _search(0, [0.0] * n_seg, [0.0] * n_node, [])
+    if order is None:
+        return {"status": "infeasible", "order": None, "steps": None}
+
+    # 复用未舍入值重算每步启动瞬间潮流，输出最低电压与最大线段负载率
+    steps = []
+    seg_extra = [0.0] * n_seg
+    node_extra = [0.0] * n_node
+    for step_no, i in enumerate(order, start=1):
+        for k in range(n_seg):
+            seg_extra[k] += startup[i] * seg_add[i][k]
+        for p in range(n_node):
+            node_extra[p] += startup[i] * node_drop[i][p]
+
+        currents = [base_seg_current[k] + seg_extra[k] for k in range(n_seg)]
+        voltages = [base_node_voltage[p] - node_extra[p] for p in range(n_node)]
+
+        min_pos = 0
+        for p in range(1, n_node):
+            if voltages[p] < voltages[min_pos] - EPS:
+                min_pos = p
+
+        max_pos = 0
+        best_rate = currents[0] / rated_current[0]
+        for k in range(1, n_seg):
+            rate = currents[k] / rated_current[k]
+            if rate > best_rate + EPS:
+                best_rate = rate
+                max_pos = k
+
+        steps.append(
+            {
+                "step": step_no,
+                "load_index": i,
+                "node": startup_loads_in[i].node,
+                "steady_current": _round(steady[i]),
+                "startup_current": _round(startup[i]),
+                "min_voltage": _round(voltages[min_pos]),
+                "min_voltage_node": tree.order[min_pos],
+                "max_loading_rate": _round(currents[max_pos] / rated_current[max_pos]),
+                "max_loading_segment_id": tree.segments[max_pos].id,
+            }
+        )
+
+        # 启动瞬间结束：该负载此后按稳态电流计入
+        delta = steady[i] - startup[i]
+        for k in range(n_seg):
+            seg_extra[k] += delta * seg_add[i][k]
+        for p in range(n_node):
+            node_extra[p] += delta * node_drop[i][p]
+
+    return {"status": "feasible", "order": order, "steps": steps}

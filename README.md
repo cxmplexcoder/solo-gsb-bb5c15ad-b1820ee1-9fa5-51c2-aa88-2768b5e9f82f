@@ -1,6 +1,6 @@
 # 直流配电树压降校核 API
 
-基于 FastAPI 的直流配电树校核服务：输入以 `source` 为根的配电树（电源电压、线段电阻与额定电流、各节点恒定负载、最低允许电压），自叶向根累计每段承载的全部下游电流，再自根向叶计算压降与节点电压，返回各段电流、各节点电压以及超额定电流 / 欠压位置；并可评估指定节点可追加的最大恒定负载电流（`/capacity`），根据若干线段的实测电流定位唯一未登记正恒定负载的候选节点（`/unregistered-load`），评估至多 K 条负载同时升至峰值时各线段 / 各节点的最坏越限风险（`/peak-risk`），在故障线段断开后评估各候选跨接线的恢复方案并择优（`/outage-restoration`），枚举可切除负载组合、选出以最小切除电流消除全部超额定与欠压的切负荷方案（`/load-shedding`），或按各线段保护曲线校核故障下各级保护的动作选择性并标出基线误动风险（`/protection-selectivity`）。
+基于 FastAPI 的直流配电树校核服务：输入以 `source` 为根的配电树（电源电压、线段电阻与额定电流、各节点恒定负载、最低允许电压），自叶向根累计每段承载的全部下游电流，再自根向叶计算压降与节点电压，返回各段电流、各节点电压以及超额定电流 / 欠压位置；并可评估指定节点可追加的最大恒定负载电流（`/capacity`），根据若干线段的实测电流定位唯一未登记正恒定负载的候选节点（`/unregistered-load`），评估至多 K 条负载同时升至峰值时各线段 / 各节点的最坏越限风险（`/peak-risk`），在故障线段断开后评估各候选跨接线的恢复方案并择优（`/outage-restoration`），枚举可切除负载组合、选出以最小切除电流消除全部超额定与欠压的切负荷方案（`/load-shedding`），或按各线段保护曲线校核故障下各级保护的动作选择性并标出基线误动风险（`/protection-selectivity`），或在既有负载之上搜索 1～10 条待投运负载的完整可行投运顺序、给出每步启动瞬间的最低电压与最大线段负载率（`/startup-order`）。
 
 ## 快速启动（单条命令）
 
@@ -28,6 +28,7 @@ docker compose up --build
 - 故障恢复评估接口：`POST http://localhost:8000/outage-restoration`
 - 切负荷方案评估接口：`POST http://localhost:8000/load-shedding`
 - 保护选择性校核接口：`POST http://localhost:8000/protection-selectivity`
+- 投运顺序评估接口：`POST http://localhost:8000/startup-order`
 
 ## 请求格式
 
@@ -593,6 +594,106 @@ curl -X POST http://localhost:8000/protection-selectivity \
 - `reason=nearest_not_operating`：距故障最近的装置未动作（故障电流低于其曲线首点），`operating_time` / `required_time` 均为 `null`；
 - `reason=insufficient_margin`：上级装置动作过早，`operating_time` 为其动作时间，`required_time` 为最近装置动作时间 + 最小级差（要求的最早动作时间）。
 
+## 投运顺序评估：POST /startup-order
+
+`POST /startup-order`，Content-Type: `application/json`。请求沿用 `/evaluate` 的配电树（`segments`）与既有负载（`loads`），并额外给出 1～10 条待投运负载（输入序号即 `startup_loads` 数组下标，从 0 开始）：
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `startup_loads` | array | 1～10 条 | 待投运负载列表；少于 1 条或多于 10 条返回 `422` |
+| `startup_loads[].node` | string | 必填，须存在于树中 | 待投运负载所在节点（可为 `source`）；不存在返回 `400 invalid_input` |
+| `startup_loads[].steady_current` | number | ≥ 0 且为有限数 | 稳态电流 (A) |
+| `startup_loads[].startup_current` | number | ≥ 0、有限且 ≥ `steady_current` | 启动电流 (A)；小于稳态电流返回 `422` |
+
+逐投运步的潮流计入规则：
+
+- **每步仅该步新投运负载按启动电流计入**，此前已投运负载按各自**稳态电流**计入，**未投运负载不计入**；
+- 待投运负载对线段电流的贡献为其电流（负载位于该线段下游时）；对某节点电压的压降贡献 = 电流 × 被校核节点与负载节点两条根路径的公共线段电阻之和（兄弟支路经公共上游线段同样计入，与 `/peak-risk` 口径一致）；
+- 判定复用**未舍入**的线段电流与节点电压：线段电流 ≤ 额定电流、各节点电压 ≥ 生效最低允许电压（含节点级 `min_voltage` 覆盖）；**恰好触限允许**（电流等于额定、电压等于最低允许电压均不算越限）。
+
+求解规则：
+
+- 先按 `/evaluate` 的校核逻辑计算基线；基线已存在超额定电流或欠压时返回 `400 baseline_violation` 并在 `details` 中列出越限位置；
+- 基线合格时，用**子集状态搜索**（已投运集合 + 深度优先枚举）寻找全部负载均能依次投运的完整可行顺序；每步按输入序号升序尝试候选，故找到的首个完整可行顺序即**按输入序号字典序最小**的顺序（需要时自动回溯，例如此前序号先走不通而后续序号先走得通时）；
+- 每步返回该步**启动瞬间**的全树**最小节点电压**与**最大线段负载率**（= 线段电流 / 额定电流，`1.0` 即 100%）；
+- 不存在完整可行顺序时 `status=infeasible`，顺序与步骤字段均为 `null`。
+
+### 请求示例
+
+```bash
+curl -X POST http://localhost:8000/startup-order \
+  -H "Content-Type: application/json" \
+  -d '{
+    "source_voltage": 48.0,
+    "min_voltage": 40.0,
+    "segments": [
+      {"id": "s1", "parent": "source", "child": "a", "resistance": 0.1,  "rated_current": 25.0},
+      {"id": "s2", "parent": "a",      "child": "b", "resistance": 0.2,  "rated_current": 20.0},
+      {"id": "s3", "parent": "a",      "child": "c", "resistance": 0.05, "rated_current": 20.0}
+    ],
+    "loads": [
+      {"node": "a", "current": 2.0},
+      {"node": "b", "current": 5.0},
+      {"node": "c", "current": 8.0}
+    ],
+    "startup_loads": [
+      {"node": "b", "steady_current": 4.0, "startup_current": 10.0},
+      {"node": "c", "steady_current": 3.0, "startup_current": 6.0}
+    ]
+  }'
+```
+
+### 响应示例（200，feasible）
+
+上例基线段电流 s1=15、s2=5、s3=8。顺序 `[0, 1]`：步 1 b 启动 10A 时 s1=25 恰好满载；步 2 c 启动 6A 时 b 已回落为稳态 4A，s1=15+4+6=25 同样恰好满载：
+
+```json
+{
+  "status": "feasible",
+  "order": [0, 1],
+  "steps": [
+    {
+      "step": 1,
+      "load_index": 0,
+      "node": "b",
+      "steady_current": 4.0,
+      "startup_current": 10.0,
+      "min_voltage": 42.5,
+      "min_voltage_node": "b",
+      "max_loading_rate": 1.0,
+      "max_loading_segment_id": "s1"
+    },
+    {
+      "step": 2,
+      "load_index": 1,
+      "node": "c",
+      "steady_current": 3.0,
+      "startup_current": 6.0,
+      "min_voltage": 43.7,
+      "min_voltage_node": "b",
+      "max_loading_rate": 1.0,
+      "max_loading_segment_id": "s1"
+    }
+  ]
+}
+```
+
+- `status`：`feasible`（存在完整可行顺序）或 `infeasible`（无完整可行顺序）。
+- `order`：按输入序号字典序最小的完整可行投运顺序（序号从 0 开始）；`infeasible` 时为 `null`。
+- `steps[]`：与 `order` 对应的逐步启动瞬间校核结果；`step` 从 1 开始，`load_index` 为本步新投运负载的输入序号。
+- `min_voltage` / `min_voltage_node`：启动瞬间全树最低节点电压 (V) 及其节点（BFS 顺序，根在前；并列取首个），展示值按 6 位小数舍入，判定使用未舍入值。
+- `max_loading_rate` / `max_loading_segment_id`：启动瞬间最大线段负载率（无量纲比值，`1.0` 即 100%）及其线段（按线段输入顺序；并列取首个），展示值按 6 位小数舍入，判定使用未舍入值。
+
+`infeasible` 响应示例（任一首步或某步的所有候选都越限）：
+
+```json
+{
+  "status": "infeasible",
+  "order": null,
+  "steps": null
+}
+```
+
 ## 错误说明
 
 所有错误均返回统一结构：
@@ -609,9 +710,9 @@ curl -X POST http://localhost:8000/protection-selectivity \
 
 | 状态码 | code | 触发场景 |
 | --- | --- | --- |
-| `422` | `validation_error` | 非正电源电压、负电阻、负负载电流、非正额定电流、实测电流为负或不是有限数（NaN/Infinity）、`peak_current` 为负或小于该负载 `current`、`max_simultaneous_peaks` 为负或缺失、`sheddable_loads` 超过 16 条 / 元素非整数、跨接线电阻为负 / 额定电流非正 / 必填字段缺失、保护曲线点电流非严格递增 / 曲线电流或动作时间为负或非有限数 / 曲线点为空 / 曲线或故障列表为空、故障电流非正或非有限数、最小级差为负或非有限数、字段缺失或类型错误等 |
-| `400` | `invalid_input` | 无效树（不连通、存在环路、节点多父节点、`source` 作为子节点、线段 id 重复）、负载引用不存在的节点、`target_node` 为 `source` / 不存在于树中、测量线段 id 重复 / 不存在于树中、故障线段不存在于树中，或跨接线 id 重复 / 与已有线段重复、供电侧 / 失电侧节点不存在或不在对应分量、`sheddable_loads` 序号越界（含负数）或重复、保护曲线未覆盖全部线段 / 线段 id 重复 / 曲线线段不存在于树中、故障节点不存在或为 `source` |
-| `400` | `baseline_violation` | `/capacity` 基线校核已存在超额定电流或欠压，`details` 列出越限线段与节点 |
+| `422` | `validation_error` | 非正电源电压、负电阻、负负载电流、非正额定电流、实测电流为负或不是有限数（NaN/Infinity）、`peak_current` 为负或小于该负载 `current`、`max_simultaneous_peaks` 为负或缺失、`sheddable_loads` 超过 16 条 / 元素非整数、跨接线电阻为负 / 额定电流非正 / 必填字段缺失、保护曲线点电流非严格递增 / 曲线电流或动作时间为负或非有限数 / 曲线点为空 / 曲线或故障列表为空、故障电流非正或非有限数、最小级差为负或非有限数、`startup_loads` 为空或超过 10 条 / 稳态或启动电流为负或非有限数 / 启动电流小于稳态电流、字段缺失或类型错误等 |
+| `400` | `invalid_input` | 无效树（不连通、存在环路、节点多父节点、`source` 作为子节点、线段 id 重复）、负载引用不存在的节点、`target_node` 为 `source` / 不存在于树中、测量线段 id 重复 / 不存在于树中、故障线段不存在于树中，或跨接线 id 重复 / 与已有线段重复、供电侧 / 失电侧节点不存在或不在对应分量、`sheddable_loads` 序号越界（含负数）或重复、保护曲线未覆盖全部线段 / 线段 id 重复 / 曲线线段不存在于树中、故障节点不存在或为 `source`、待投运负载节点不存在于树中 |
+| `400` | `baseline_violation` | `/capacity`、`/startup-order` 基线校核已存在超额定电流或欠压，`details` 列出越限线段与节点 |
 
 注意：`/unregistered-load` 的 `inconsistent` / `undetermined` 是正常分析结论，以 `200` 返回并体现在响应体的 `status` 字段中，不属于上表错误。
 
@@ -628,7 +729,7 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py    # FastAPI 应用与错误处理
-  core.py    # 树校验 + 电流累计 + 压降计算 + 增容评估 + 未登记负载定位 + 峰值风险评估 + 故障恢复评估 + 切负荷方案 + 保护选择性校核
+  core.py    # 树校验 + 电流累计 + 压降计算 + 增容评估 + 未登记负载定位 + 峰值风险评估 + 故障恢复评估 + 切负荷方案 + 保护选择性校核 + 投运顺序搜索
   models.py  # 请求 / 响应模型
 tests/
   test_evaluate.py
@@ -638,6 +739,7 @@ tests/
   test_outage_restoration.py
   test_load_shedding.py
   test_protection_selectivity.py
+  test_startup_order.py
 Dockerfile
 docker-compose.yml
 requirements.txt
