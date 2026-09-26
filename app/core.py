@@ -36,6 +36,13 @@ source 所在分量接入失电分量任意节点，失电分量从接入点重�
 故障沿故障节点至 source 的路径计算各级装置动作时间：距故障最近的装置必须动作，
 所有会动作的上级装置须比它至少晚最小级差，违反者记为失配线段；并用基线线段电流
 标出正常负荷下即会动作（可能误动）的装置。返回逐故障动作顺序、失配线段与总体结论。
+
+``startup_order`` 在基线校核通过的前提下，为 1～10 条待投运负载（节点、稳态电流、
+启动电流，启动电流须不小于稳态电流）搜索完整可行的投运顺序：每步仅本步新投运负载
+按启动电流计入、此前投运负载按稳态电流计入，未投运负载不计入；用未舍入的线段电流
+与节点电压按与 ``evaluate`` 相同的规则判定超额定与欠压（恰好触限允许）。可行性对
+已投运集合具有单调性，按输入序号递增做子集状态深度优先搜索并记忆不可行集合，首个
+完整顺序即按输入序号字典序最小者。
 """
 
 from __future__ import annotations
@@ -1246,3 +1253,147 @@ def protection_selectivity(
         "faults": fault_results,
         "misoperation_segments": misoperation_segments,
     }
+
+
+def _energized_tree(
+    base: _Tree,
+    source_voltage: float,
+    startup_in: Sequence,
+    energized: set[int],
+    new_index: Optional[int],
+) -> _Tree:
+    """在基线树 ``base`` 上叠加待投运负载后重算潮流。
+
+    ``energized`` 中（此前已投运）的负载按稳态电流计入；``new_index``（本步新投运
+    负载）按启动电流计入；其余（未投运）负载不计入。树结构与节点最低允许电压覆盖
+    保持不变，自叶向根重算线段电流、自根向叶重算节点电压（均为未舍入值）。
+    """
+    extra: dict[str, float] = {}
+    for i in energized:
+        load = startup_in[i]
+        extra[load.node] = extra.get(load.node, 0.0) + load.steady_current
+    if new_index is not None:
+        load = startup_in[new_index]
+        extra[load.node] = extra.get(load.node, 0.0) + load.startup_current
+
+    node_total = {
+        node: base.load_map.get(node, 0.0) + extra.get(node, 0.0) for node in base.order
+    }
+    seg_current: dict[str, float] = {}
+    for node in reversed(base.order):
+        for seg in base.children_map.get(node, []):
+            seg_current[seg.id] = node_total[seg.child]
+            node_total[node] += node_total[seg.child]
+
+    node_voltage = {ROOT_NODE: source_voltage}
+    for node in base.order:
+        for seg in base.children_map.get(node, []):
+            node_voltage[seg.child] = node_voltage[node] - seg_current[seg.id] * seg.resistance
+
+    return replace(base, node_total=node_total, seg_current=seg_current, node_voltage=node_voltage)
+
+
+def startup_order(
+    source_voltage: float,
+    min_voltage: float,
+    segments_in: Sequence,
+    loads_in: Sequence,
+    startup_loads_in: Sequence,
+) -> dict:
+    """搜索待投运负载完整可行的投运顺序，返回可 JSON 序列化的结果字典。
+
+    接收 1～10 条待投运负载（条数由请求模型保证），其节点须存在于树中，启动电流
+    不小于稳态电流由请求模型保证。基线（仅既有负载）已越限时抛
+    ``BaselineViolationError``；否则按输入序号递增做子集状态深度优先搜索：
+
+    - 每步新投运负载按启动电流计入，此前投运负载按稳态电流计入，未投运负载不计入；
+    - 越限判定沿用 ``evaluate`` 的额定电流、节点最低允许电压（含节点级覆盖）与
+      EPS 容差规则（未舍入值比较，恰好触限不算越限）；
+    - 可行性对已投运集合单调（新增负载只增电流、只降电压），不可行集合记忆化；
+    - 首个完整顺序即按输入序号字典序最小者；不存在完整顺序时 ``status=infeasible``。
+    """
+    base = _prepare_tree(source_voltage, segments_in, loads_in)
+
+    known_nodes = set(base.parent_of) | {ROOT_NODE}
+    errors: list[str] = []
+    for index, load in enumerate(startup_loads_in):
+        if load.node not in known_nodes:
+            errors.append(f"第 {index + 1} 条待投运负载的节点 '{load.node}' 不存在于树中")
+    if errors:
+        raise InputValidationError("待投运负载定义无效", errors)
+
+    over_current_segments, under_voltage_nodes = _find_violations(base, min_voltage)
+    if over_current_segments or under_voltage_nodes:
+        details = [
+            f"线段 '{v['segment_id']}' 已超额定电流：{v['current']} A（额定 {v['rated_current']} A）"
+            for v in over_current_segments
+        ]
+        details += [
+            f"节点 '{v['node']}' 已欠压：{v['voltage']} V（最低允许 {v['min_voltage']} V）"
+            for v in under_voltage_nodes
+        ]
+        raise BaselineViolationError("基线校核已存在超额定电流或欠压，无法安排投运顺序", details)
+
+    n = len(startup_loads_in)
+    dead: set[int] = set()  # 记忆化：已证实不存在完整可行顺序的已投运集合（位掩码）
+
+    def _search(mask: int, order: list[int]) -> Optional[list[int]]:
+        energized = set(order)
+        for i in range(n):
+            if mask >> i & 1:
+                continue
+            candidate = mask | (1 << i)
+            if candidate in dead:
+                continue
+            tree = _energized_tree(base, source_voltage, startup_loads_in, energized, i)
+            over, under = _find_violations(tree, min_voltage)
+            if over or under:
+                continue  # 该负载本步启动瞬间越限（恰好触限不算越限）
+            if candidate == (1 << n) - 1:
+                return order + [i]
+            result = _search(candidate, order + [i])
+            if result is not None:
+                return result
+        dead.add(mask)
+        return None
+
+    order = _search(0, [])
+    if order is None:
+        return {"status": "infeasible", "order": None, "steps": None}
+
+    steps = []
+    for step_no, index in enumerate(order, start=1):
+        energized = set(order[: step_no - 1])
+        tree = _energized_tree(base, source_voltage, startup_loads_in, energized, index)
+
+        # 最小电压节点：BFS 顺序最先（未舍入值比较，EPS 内视为平局）
+        min_node = base.order[0]
+        min_voltage_value = tree.node_voltage[min_node]
+        for node in base.order[1:]:
+            if tree.node_voltage[node] < min_voltage_value - EPS:
+                min_voltage_value = tree.node_voltage[node]
+                min_node = node
+
+        # 最大负载率线段：输入顺序最先（未舍入值比较，EPS 内视为平局）
+        max_seg = base.segments[0]
+        max_ratio = tree.seg_current[max_seg.id] / max_seg.rated_current
+        for seg in base.segments[1:]:
+            ratio = tree.seg_current[seg.id] / seg.rated_current
+            if ratio > max_ratio + EPS:
+                max_ratio = ratio
+                max_seg = seg
+
+        steps.append(
+            {
+                "step": step_no,
+                "load_index": index,
+                "node": startup_loads_in[index].node,
+                "startup_current": startup_loads_in[index].startup_current,
+                "min_voltage": _round(min_voltage_value),
+                "min_voltage_node": min_node,
+                "max_loading_ratio": _round(max_ratio),
+                "max_loading_segment_id": max_seg.id,
+            }
+        )
+
+    return {"status": "feasible", "order": order, "steps": steps}

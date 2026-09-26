@@ -409,3 +409,64 @@ class ProtectionSelectivityResponse(BaseModel):
     misoperation_segments: list[MisoperationSegmentResult] = Field(
         description="基线电流下即会动作（可能误动）的装置，按线段输入顺序"
     )
+
+
+class StartupLoadInput(BaseModel):
+    """一条待投运负载：节点、稳态电流与启动电流。"""
+
+    node: str = Field(min_length=1, description="待投运负载所在节点（须存在于树中，可为 source）")
+    steady_current: float = Field(
+        ge=0, allow_inf_nan=False, description="稳态电流 (A)，不允许为负"
+    )
+    startup_current: float = Field(
+        ge=0, allow_inf_nan=False, description="启动电流 (A)，不允许为负且须不小于稳态电流"
+    )
+
+    @model_validator(mode="after")
+    def _startup_not_below_steady(self) -> "StartupLoadInput":
+        if self.startup_current < self.steady_current:
+            raise ValueError("启动电流不能小于稳态电流")
+        return self
+
+
+class StartupOrderRequest(EvaluateRequest):
+    """投运顺序评估请求：在 /evaluate 参数基础上指定 1～10 条待投运负载。"""
+
+    startup_loads: list[StartupLoadInput] = Field(
+        min_length=1,
+        max_length=10,
+        description="待投运负载列表（1～10 条）；每条给出节点、稳态电流与启动电流",
+    )
+
+
+class StartupStepResult(BaseModel):
+    step: int = Field(description="投运步号（从 1 开始）")
+    load_index: int = Field(description="本步新投运负载在 startup_loads 中的输入序号（从 0 开始）")
+    node: str = Field(description="本步新投运负载所在节点")
+    startup_current: float = Field(description="本步新投运负载计入的启动电流 (A)")
+    min_voltage: float = Field(
+        description="启动瞬间全树最小节点电压 (V)，展示值按 6 位小数舍入，判定使用未舍入值"
+    )
+    min_voltage_node: str = Field(description="取得最小电压的节点（平局取 BFS 顺序最先者）")
+    max_loading_ratio: float = Field(
+        description="启动瞬间全树最大线段负载率 = 线段电流 / 额定电流，"
+        "展示值按 6 位小数舍入，判定使用未舍入值"
+    )
+    max_loading_segment_id: str = Field(
+        description="取得最大负载率的线段 id（平局取线段输入顺序最先者）"
+    )
+
+
+class StartupOrderResponse(BaseModel):
+    status: str = Field(
+        description="求解结果：feasible=存在完整可行的投运顺序，infeasible=无完整可行顺序"
+    )
+    order: Optional[list[int]] = Field(
+        default=None,
+        description="按输入序号字典序最小的可行投运顺序（startup_loads 数组下标，从 0 开始）；"
+        "infeasible 时为 null",
+    )
+    steps: Optional[list[StartupStepResult]] = Field(
+        default=None,
+        description="按 order 逐步给出的启动瞬间校核摘要；infeasible 时为 null",
+    )
